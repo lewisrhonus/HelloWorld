@@ -1,0 +1,329 @@
+---
+title: "Graded Assignment 3"
+
+output: html_notebook
+---
+# Team 9: Ce Yan, Hunter Hollis, Amber Wan
+Before we start, we need to load the data:
+```{r}
+rm(list = ls())
+source("ROCPlot.r")
+DataOrig <- read.table("spambasedata-Orig.csv",sep=",",header=T,
+                       stringsAsFactors=F)
+DataCoded <- read.table("spambasedata-Coded.csv",sep=",",header=T,
+                        stringsAsFactors=T)
+```
+Since we have 0-1 variables as the target, we should turn it into factors to make our classification jobs easier.
+```{r}
+DataOrig$IsSpam <- as.factor(DataOrig$IsSpam)
+DataCoded$IsSpam <- as.factor(DataCoded$IsSpam)
+```
+Then I should create our 60-40 split of training and validation data set.
+```{r}
+load(file="SpamdataPermutation.RData")
+DataCoded <- DataCoded[ord,]
+DataOrig <- DataOrig[ord,]
+
+# Doing a 60-40 split on coded data
+TrainInd <- ceiling(nrow(DataCoded)*0.6)
+TrainData <- DataCoded[1:TrainInd,]
+ValData <- DataCoded[(TrainInd+1):nrow(DataCoded),]
+
+# on original data
+TrainDataOrig <- DataOrig[1:TrainInd,]
+ValDataOrig <- DataOrig[(TrainInd+1):nrow(DataOrig),]
+```
+Since we have coded and original (uncoded) data, we will use comething like _coded or _orig to make them and related variables in this assignment.  
+Because we want to do some in-sample feature selection, we need to further split our training data to a sub-training and sub-validation data set, using an 80-20 split. The reason for 80-20 is that the further split makes our training set "shrink" already, we want to make sure we have enough training samples.
+```{r}
+
+#Doing a 80-20 split on Training data
+TrainInd2 <- ceiling(nrow(DataCoded)*0.48)
+TrainData_in <- DataCoded[1:TrainInd2,]
+ValData_in <- DataCoded[(TrainInd2+1):TrainInd,]
+```
+Now, let's check how many data we have.
+```{r}
+nrow(DataCoded)
+nrow(DataOrig)
+nrow(TrainData)
+nrow(TrainData_in)
+nrow(ValData_in)
+nrow(ValData)
+```
+Then let's check how is our target distributed in different sets.
+```{r}
+mean(as.integer(TrainData$IsSpam)-1)
+mean(as.integer(ValData$IsSpam)-1)
+```
+Looks OK. Let's start.  
+
+# Question 1:
+**Question:**   
+Indicate the strategy you take and explain what the likely effect is on possible overfitting to the validation data set. Indicate the pros and cons of you decision and why you made the decision you did.  
+**Answers:**  
+Our strategy is that we want to build a naive bayes model, two logistic regression model, and a tree-based model using only our 60% training sample. By only, I mean that 1)we will use in-sample cretirion to select features for logistic regression and tree(AIC for logistic regression, Gini for tree); 2) we will use AUC of ROC to select features for naive bayes model, but withour touching the 40% validation data, instead we will use the 20%  ValData_in data to do this job.  
+**Reasons:**  
+1. We want the three model to compete with each other justly on pure our-of-sample performance. If we use the 40% validation data to choose features for naive Bayes model, it feels like it is cheating on the validation set.  
+2. For logestic regression and the tree, for this assignment, we need not to introduce nested cross-validation, because, we believe, the main objective for doing that is to eliminate overfitting, which is not likely to happen in this case (because we are only allowed 10 features, whit which it is hard to overfit).  
+**Pros and Cons:**  
+1. Of course, overfitting can still happen, but it is very unlikely. We checked on it somehow, but to save space, we will not show our progress. 
+2. We will have smaller training set, but `r nrow(TrainData_in)` is just fine.
+3. Out choice at this stage makes sure we are not cheating on the validation set before the competition, and leave us some room to build some ensemble algorithm using the untouched validation data.
+# Question 2:
+**Question:**   
+Using the coded spam data set, find the best naïve Bayes model that you can find that uses no more than 10 features.  
+**Answers:**  
+First, let's find the Positive Probability:
+```{r}
+(PSpam <- mean(as.integer(TrainData$IsSpam)-1))
+```
+Then, let's find out the conditional probability of Xs given y using a function.  
+With the function.
+```{r}
+fn <- function(x) {
+  Probs <- table(x)
+  Probs <- Probs/sum(Probs)
+  return(Probs)
+}
+PGivenSpam <- lapply(TrainData_in[TrainData_in$IsSpam==1,],FUN=fn)
+PGivenHam <- lapply(TrainData_in[TrainData_in$IsSpam!=1,],FUN=fn)
+```
+Then, we can use another function to generate our prediction of probability, to make things clear, we renamed it fn_pspam:
+```{r}
+fn_pspam <- function(DataRow,PGivenSpam,PGivenHam,PSpam) {
+  tmp1 <- 1.0
+  tmp2 <- 1.0
+  for(x in names(DataRow)) {
+    tmp1 <- tmp1*PGivenSpam[[x]][DataRow[x]]
+    tmp2 <- tmp2*PGivenHam[[x]][DataRow[x]]
+  }
+  out <- tmp1*PSpam/(tmp1*PSpam+tmp2*(1-PSpam))
+  return(out)
+}
+```
+This function, when applied to a data frame, where whVars is our selected feature, will generate our  prediction:
+```{r}
+# PSpam_bayes <- apply(ValData_in[,whVars,drop=F],1,FUN=fn_pspam,PGivenSpam,PGivenHam,PSpam)
+```
+But instead of running this code, let's find our best set of features first. We use forward selection to choose our best ten features. The basic idea is to loop acrosss all features, find our first winner that generates a best one-feature naive bayes prediction, and find our second winner that collaberates with the first winner to generate a best two-feature prediction, and our third winner collaborating with the first and second...   
+In the procedure, we define "best" prediction as the predicted probabilities which have the largest AUC of ROC. To make our job easier, we define a function fn_NB_AUC which takes the features as input, and generates the AUC as output (here we are using ValData_in, which is the 20% inside our 60% training set):
+```{r}
+fn_NB_AUC <- function(whVars){
+  PSpam_bayes <- apply(ValData_in[,whVars,drop=F],1,FUN=fn_pspam,PGivenSpam,PGivenHam,PSpam)
+  out <- ROCPlot(PSpam_bayes,ValData_in[,"IsSpam"], Plot = F)$AUC
+  return(out)
+}
+```
+Now, Let's find our first winner use a simple for loop:
+```{r}
+AUCs <- c()
+for (i in 1:(ncol(TrainData_in)-1)){
+  whVars <- colnames(TrainData_in)[i]
+  AUC <- fn_NB_AUC(whVars)
+  AUCs <- append(AUCs,AUC)
+}
+Var1 <- which.max(AUCs)
+colnames(TrainData[Var1])
+```
+We now have our first winner, let's find other winners (this loop takes a while):
+```{r}
+for (k in 2:10){
+col_names <- c()
+AUCs <- c()
+
+for (j in 1:(ncol(TrainData_in)-1)){
+    whVars <- colnames(TrainData_in)[c(Var1,j)]
+    col_names <- append(col_names,paste0(colnames(TrainData_in)[j]))
+    AUC <- fn_NB_AUC(whVars)
+    AUCs <- append(AUCs,AUC)
+}
+Var2 <- which.max(AUCs)
+Var1 <- c(Var1,Var2)
+}
+colnames(TrainData[Var1])
+```
+Above are our ten chosen features.  
+We need to do some explanation of our loop. We know we should have some kind of if clause to avoiding choosing same features in different rounds of this loop, but there is a "bug" in the ROCPlot function that can help us address this problem. We found this little thing, and instead of fixing it, we decided to take advantage of it.   
+Here is how it happen. If we feed two same variables into the fn_pspam function, it returns numeric(0).
+```{r}
+whVars <- c(56,56)
+apply(ValData_in[,whVars,drop=F],1,FUN=fn_pspam,PGivenSpam,PGivenHam,PSpam)
+```
+And, if we put numeric(0) into ROCplot function, it will reture the ACU of random guesing, which is 0.5, and of course, has no chance to win any round in the loop.
+```{r}
+ROCPlot(numeric(0),ValData_in[,"IsSpam"],Plot = F)$AUC
+```
+To make sure that we take the advantage correctly, let's check our outcome from the loop. (For this purpose, we have generated some trace in the loop)
+```{r}
+cbind(col_names,AUCs)
+```
+As we can see, there are nine 0.5 in the AUC colums, which belongs to the winners of the first nine rounds. (If I win the round n, I will get a 0.5 in round n+1 and be out of the game.)  
+Now our winners are ready, let's make predictions on our true validation data:
+```{r}
+PSpam_bayes <- apply(ValData[,Var1,drop=F],1,FUN=fn_pspam,PGivenSpam,PGivenHam,PSpam)
+hist(PSpam_bayes, nclass = 20)
+```
+The ROC Plot:
+```{r}
+(AUC_bayes <-ROCPlot(PSpam_bayes,ValData[,"IsSpam"])$AUC)
+```
+# Question 3:
+**Question:**  
+Using the coded spam data set, find the best logistic regression model that you can find that uses no more than 10 features.  
+**Answers:**  
+We use step function to build our logistic regression model.
+```{r, message=FALSE, warning=FALSE}
+#set step-wise
+SmallFm <- IsSpam ~ 1
+BigFm <- IsSpam ~ .
+
+#Coded step-wise
+OutSmall <- glm(IsSpam ~ 1, family="binomial", data=TrainData)
+OutBig <- glm(IsSpam ~ . , family="binomial", data=TrainData)
+sc <- list(lower=OutSmall,upper=OutBig)
+outCode <- step(OutSmall,scope=sc,direction="forward", trace=0, steps = 10)
+```
+Let's look at the model:
+```{r, echo=FALSE}
+summary(outCode)
+```
+With predict function, we can get predicted probabiliry from logistic regression:
+```{r}
+PSpam_logit_coded = predict(outCode, newdata = ValData, type = "response")
+hist(PSpam_logit_coded, nclass = 20)
+```
+The distribution of predicted probabiliry looks similiar to that of our vaive bayes model.  
+Now let's look at the ROC plot:
+```{r}
+(AUC_logit_coded <- ROCPlot(PSpam_logit_coded, ValData[,"IsSpam"])$AUC)
+```
+# Question 4
+**Question:**  
+Using the un-coded spam data set, find the best logistic regression model that you can find that uses no more than 10 features.  
+**Answers:**  
+Let's do the same on the uncoded data:
+```{r, message=FALSE, warning=FALSE}
+OutSmall <- glm(IsSpam ~ 1, family="binomial", data=TrainDataOrig)
+OutBig <- glm(IsSpam ~ . , family="binomial", data=TrainDataOrig)
+sc <- list(lower=OutSmall,upper=OutBig)
+outOrig <- step(OutSmall,scope=sc,direction="forward", trace=0, steps = 10)
+```
+Let's look at the model:
+```{r, echo=FALSE}
+summary(outOrig)
+```
+Make our prediction:
+```{r}
+PSpam_logit_orig = predict(outOrig, newdata = ValDataOrig, type = "response")
+hist(PSpam_logit_orig,nclass = 20)
+```
+This distribution is slightly different from what we got from the coded logestic regression model. Let's check ROC:
+```{r}
+(AUC_logit_orig <- ROCPlot(PSpam_logit_orig, ValDataOrig[,"IsSpam"])$AUC)
+```
+# Question 5
+**Question:**  
+Of these three models which seems to be better? How much of an effect did coding the variables seem to have?
+**Answers:**   
+The AUC of the uncoded logistic regression is slightly lower that what we had in the coded model, it seems that coding does help us improve logistic regression model performance. However, this is perhaps because that the coded model, although with the same number of variables, has way higher dimensions than the uncoded model.
+# Question 6
+**Question:**  
+Using one other technique that we have learned about, find the best model that uses no more than ten features and compare its performance to the other models.
+**Answers:**   
+For this part, we choose to build a classification tree.   
+Because the tree has a built-in feature selection procedure, in this case, we will use the default Gini, so that we would not bother to select features manually.  
+We are allowed ten features, so we require the tree to return eleven nodes.
+```{r}
+Tree <- tree(IsSpam ~ ., data = TrainDataOrig)
+PrunedTree1 <- prune.tree(Tree2, best=11)
+summary(PrunedTree)
+```
+Only eight feature are used, so we can allow it to have more nodes.
+```{r}
+PrunedTree2 <- prune.tree(Tree2, best=15)
+summary(PrunedTree)
+```
+It seems like our learner is just reluctant to take more than eight features. We will accept this tree as our best.  
+Now let's make predictions.
+```{r}
+PSpam_tree <- predict(Tree2, newdata = ValDataOrig[,1:ncol(ValDataOrig)-1],type = "vector")[,2]
+hist(PSpam_tree, nclass = 20)
+```
+The ROC plot:
+```{r}
+(AUC_tree <- ROCPlot(PSpam_tree,ValDataOrig[,"IsSpam"])$AUC)
+```
+# Question 5
+**Question:**  
+Construct the best ensemble approach that you can based on the naïve Bayes approach, one of the two logistic regression approaches, and the additional approach you selected for item (6). Base your ensemble approach on combining the probabilities from the models. Keep things very simple. How does the performance of the ensemble approach compare to the performance of the individual model.
+**Answers:**   
+First, let's select which models to put into the ensemble model. We want the input of ensemble to be less correlated, so let's check the correlation:
+```{r}
+predictions <- as.data.frame(cbind(PSpam_bayes,
+                          PSpam_logit_coded,PSpam_logit_orig,
+                          PSpam_tree))
+cor(predictions)
+```
+Compared to the coded logistic regression, the uncoded one is less correlated with the other two model, so let's use the uncoded one.
+```{r}
+predictions <- as.data.frame(cbind(PSpam_bayes,
+                          PSpam_logit_orig,
+                          PSpam_tree))
+```
+before we ensemble, let's printed out all our model's performance:
+```{r}
+AUC_bayes
+AUC_logit_coded
+AUC_logit_orig
+AUC_tree
+```
+
+We use the mean as our first ensemble method, check the ROC:
+```{r}
+(AUC_mean <- ROCPlot(rowMeans(predictions), ValDataOrig[,"IsSpam"])$AUC)
+```
+This is lower than the AUC of our coded logestic regression, `r AUC_logit_coded`, but this is still better of the three input models.  
+We use the median as our second ensemble method, chech the ROC:
+```{r}
+(AUC_median <-ROCPlot(apply(predictions,1, median), ValDataOrig[,"IsSpam"])$AUC)
+```
+This one is slightly still higher than its input, but lower than the coded logestic regression.  
+Let's try to just put the coded logestic regression anyway, and generate ensemble prediction using mean and median:
+```{r}
+predictions1 <- as.data.frame(cbind(PSpam_bayes,
+                          PSpam_logit_coded,
+                          PSpam_tree))
+ROCPlot(rowMeans(predictions), ValDataOrig[,"IsSpam"],Plot = F)$AUC
+ROCPlot(apply(predictions,1, median), ValDataOrig[,"IsSpam"],Plot = F)$AUC
+```
+This is still no better than just single coded logistic regression.     
+Now, instead of weighted mean, let's try something different (and fun): we can further split our validation data, and use some of them to train a new logistic regression, which takes the predicted probability of our models as input, and see how this ensemble model performs:
+```{r}
+# Do a 60-40 split on Validation data
+TrainInd3 <- ceiling(nrow(DataCoded)*0.82)
+TrainData_ESB <- DataCoded[(TrainInd+1):TrainInd3,]
+TrainData_ESB_org <- DataOrig[(TrainInd+1):TrainInd3,]
+ValData_ESB <- DataCoded[(TrainInd3+1):nrow(DataCoded),]
+ValData_ESB_org <- DataOrig[(TrainInd3+1):nrow(DataCoded),]
+
+# Do predictions
+TrainData_ESB$PSpam_tree <- predict(Tree2, newdata = TrainData_ESB_org[,1:ncol(ValDataOrig)-1],type = "vector")[,2]
+TrainData_ESB$PSpam_bayes <- apply(TrainData_ESB[,Var1,drop=F],1,FUN=fn_pspam,PGivenSpam,PGivenHam,PSpam)
+TrainData_ESB$PSpam_logit_orig = predict(outOrig, newdata = TrainData_ESB_org, type = "response")
+
+ValData_ESB$PSpam_tree <- predict(Tree2, newdata = ValData_ESB_org[,1:ncol(ValDataOrig)-1],type = "vector")[,2]
+ValData_ESB$PSpam_bayes <- apply(ValData_ESB[,Var1,drop=F],1,FUN=fn_pspam,PGivenSpam,PGivenHam,PSpam)
+ValData_ESB$PSpam_logit_orig = predict(outOrig, newdata = ValData_ESB_org, type = "response")
+
+# Train model:
+ESB_log <- glm(IsSpam ~ PSpam_bayes+PSpam_logit_orig+PSpam_tree,
+               family="binomial", data=TrainData_ESB)
+
+# Predict:
+ESB_predict <- predict(ESB_log, newdata = ValData_ESB, type = "response")
+ROCPlot(ESB_predict, ValData_ESB[,"IsSpam"])$AUC
+```
+This model has the highest AUC among all models we have tried, and this is also the highest performance increase among all the ensemble method we have tried.
+
+
